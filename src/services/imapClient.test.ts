@@ -18,6 +18,9 @@ import {
   imapGetMessage,
   imapGetMessageHeaders,
   imapGetMessageSource,
+  imapGetMessageRfc822,
+  MAX_RFC822_INLINE_BYTES,
+  MAX_RFC822_FILE_BYTES,
   HEADER_WINDOW_BYTES,
   MAX_COMPOSE_SOURCE_BYTES,
   imapMarkRead,
@@ -47,6 +50,7 @@ import {
   type ImapConfig,
 } from "@/services/imapClient.js";
 import { MAX_IMAP_ATTACHMENT_BYTES } from "@/utils/attachmentLimits.js";
+import { createHash } from "node:crypto";
 
 const cfg: ImapConfig = {
   host: "imap.gmail.com",
@@ -90,7 +94,10 @@ function makeClient(uids: number[], rec: Rec): ImapClientLike {
     },
     fetchOne: async () => false,
     list: async () => [{ path: "[Gmail]/All Mail", name: "All Mail", specialUse: "\\All" }],
-    status: async (path: string) => ({ path, messages: 0, unseen: 0, recent: 0 }),
+    // Defaults to the mock's own uid count so the #246 search-vs-STATUS guard
+    // (a search total can never exceed the mailbox's own STATUS count) does
+    // not trip on every existing test that doesn't care about it.
+    status: async (path: string) => ({ path, messages: uids.length, unseen: 0, recent: 0 }),
     download: async () => ({
       meta: { filename: "file.bin" },
       content: (async function* () {
@@ -454,6 +461,29 @@ describe("resolveMailboxPath", () => {
 });
 
 describe("imapSearchMessages", () => {
+  it("body adds a server-side IMAP BODY criterion", async () => {
+    const rec: Rec = {};
+    await imapSearchMessages(
+      { body: "Alfred", limit: 5 },
+      { config: cfg, connect: async () => makeClient([1, 2, 3], rec) }
+    );
+    expect(rec.criteria).toEqual({ body: "Alfred" });
+  });
+
+  it("body combines with query and the other filters (all ANDed)", async () => {
+    const rec: Rec = {};
+    await imapSearchMessages(
+      { query: "accounts", body: "dividend", from: "jla", dateFrom: "2026-01-01", limit: 5 },
+      { config: cfg, connect: async () => makeClient([1, 2, 3], rec) }
+    );
+    expect(rec.criteria).toEqual({
+      or: [{ subject: "accounts" }, { from: "accounts" }],
+      body: "dividend",
+      from: "jla",
+      since: new Date("2026-01-01"),
+    });
+  });
+
   it("server-side searches, formats UID rows, newest-first, with limit", async () => {
     const rec: Rec = {};
     const res = await imapSearchMessages(
@@ -521,6 +551,7 @@ describe("imapSearchMessages", () => {
         return { release: () => undefined };
       },
       search: async () => matches[selected] ?? [],
+      status: async (path: string) => ({ path, messages: (matches[path] ?? []).length }),
       fetch: async function* (range: string) {
         for (const uid of range.split(",").map(Number)) {
           yield {
@@ -566,6 +597,7 @@ describe("imapSearchMessages", () => {
         return { release: () => undefined };
       },
       search: async () => (selected === "INBOX" ? [7] : []),
+      status: async (path: string) => ({ path, messages: path === "INBOX" ? 1 : 0 }),
     };
 
     const res = await imapSearchMessages(
@@ -580,6 +612,52 @@ describe("imapSearchMessages", () => {
     expect(res.partial).toBe(true);
     expect(res.failedMailboxes).toEqual(["Archive"]);
     expect(res.text).toContain('Could not search mailbox(es): "Archive"');
+  });
+});
+
+// #246 (@j5pu): imapflow (vendored 1.7.8) can register an untagged ESEARCH
+// handler even for a plain "legacy" SEARCH (no returnOptions) — servers may
+// answer with an ESEARCH whose compact "ALL" sequence-set range gets expanded
+// bounded by connection.mailbox.exists, not by the range's real content.
+// Reproduced directly against node_modules/imapflow/lib/commands/search.js: a
+// stale/wrong exists of 100085 turned a true 14-message "SEARCH ALL" into
+// exactly 100085 fabricated matches. Whatever corrupts imapflow's internal
+// state, a SEARCH match count can never legitimately exceed the mailbox's own
+// message count — cross-checking against STATUS (a fresh round trip,
+// independent of imapflow's cached state) catches it before a fabricated
+// total or a fetch of nonexistent UIDs ever reaches the caller.
+describe("#246 search total is cross-checked against STATUS before being trusted", () => {
+  it("rejects a search total wildly exceeding the mailbox's own STATUS count", async () => {
+    const rec: Rec = {};
+    const client: ImapClientLike = {
+      ...makeClient([], rec),
+      // Simulates the fabricated result: imapflow's ESEARCH range-expansion
+      // handed back ~100085 sequential "matches" for a mailbox that STATUS
+      // (and a direct IMAP check) says holds only 14 messages.
+      search: async () => Array.from({ length: 100085 }, (_, i) => i + 4),
+      status: async (path: string) => ({ path, messages: 14 }),
+    };
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // Fails loud rather than reporting a fabricated "100085 total listed" —
+    // this repo's established idiom (failedMailboxes, surfaced here as a
+    // thrown error since INBOX is the only requested mailbox) for "don't
+    // trust it" beats silently returning a corrupted count.
+    await expect(
+      imapListMessages({ mailbox: "INBOX", limit: 1 }, { config: cfg, connect: async () => client })
+    ).rejects.toThrow(/IMAP list failed in every requested mailbox.*INBOX/);
+    expect(errSpy.mock.calls.join("\n")).toMatch(
+      /reported 100085 matches, more than the mailbox's own 14 messages/
+    );
+    errSpy.mockRestore();
+  });
+
+  it("still trusts a search total that stays within the mailbox's real size", async () => {
+    const res = await imapListMessages(
+      { mailbox: "INBOX", limit: 10 },
+      { config: cfg, connect: async () => makeClient([7, 8], {}) }
+    );
+    expect(res.count).toBe(2);
+    expect(res.text).toContain("2 total listed");
   });
 });
 
@@ -2539,5 +2617,150 @@ describe("imapGetMessageSource", () => {
     const tooBig = sourceClient(Buffer.alloc(MAX_COMPOSE_SOURCE_BYTES + 1, 65));
     await expect(imapGetMessageSource(id, tooBig.deps)).rejects.toThrow("25 MiB");
     expect(tooBig.release).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("imapGetMessageRfc822 (#244 — raw bytes with IMAP identity)", () => {
+  const id = encodeImapId(cfg.accountLabel, "Archive/Inbox", 42);
+  const raw = Buffer.from(
+    "Message-ID: <evidence@example.com>\r\nSubject: =?ISO-8859-1?Q?caf=E9?=\r\n\r\nBody é\r\n",
+    "latin1"
+  );
+  function rfcClient(
+    source: Buffer | string = raw,
+    overrides: Record<string, unknown> = {},
+    withMailbox = true
+  ) {
+    const release = vi.fn();
+    const client = {
+      ...makeClient([], {}),
+      ...(withMailbox
+        ? { mailbox: { path: "Archive/Inbox", uidValidity: 1234567890n, readOnly: true } }
+        : {}),
+      getMailboxLock: vi.fn(async () => ({ release })),
+      fetchOne: vi.fn(async () => ({
+        uid: 42,
+        source,
+        flags: new Set(["\\Seen", "$Forwarded"]),
+        internalDate: new Date("2026-06-01T12:00:00Z"),
+        size: Buffer.byteLength(source),
+        envelope: { messageId: "<evidence@example.com>" },
+        ...overrides,
+      })),
+    };
+    const connect = vi.fn(async () => client);
+    return { client, release, connect, deps: { config: cfg, connect } };
+  }
+
+  it("opens the mailbox read-only, fetches BODY.PEEK[] and returns identity + sha256", async () => {
+    const d = rfcClient();
+    const r = await imapGetMessageRfc822(id, {}, d.deps);
+    expect(r.success).toBe(true);
+    if (!r.success) return;
+    expect(d.connect).toHaveBeenCalledWith(cfg);
+    expect(d.client.getMailboxLock).toHaveBeenCalledWith("Archive/Inbox", { readOnly: true });
+    expect(d.client.fetchOne).toHaveBeenCalledWith(
+      "42",
+      {
+        uid: true,
+        flags: true,
+        internalDate: true,
+        size: true,
+        envelope: true,
+        source: { start: 0, maxLength: MAX_RFC822_INLINE_BYTES + 1 },
+      },
+      { uid: true }
+    );
+    // Bytes are the wire payload, untouched — the latin-1 é survives as 0xE9.
+    expect(r.acquisition.bytes.equals(raw)).toBe(true);
+    expect(r.acquisition.sha256).toBe(createHash("sha256").update(raw).digest("hex"));
+    expect(r.acquisition).toMatchObject({
+      account: cfg.accountLabel,
+      mailbox: "Archive/Inbox",
+      uid: 42,
+      uidValidity: "1234567890",
+      internalDate: "2026-06-01T12:00:00.000Z",
+      flags: ["\\Seen", "$Forwarded"],
+      size: raw.length,
+      messageId: "evidence@example.com",
+      warnings: [],
+    });
+    expect(r.acquisition.readMethod).toContain("EXAMINE");
+    expect(r.acquisition.readMethod).toContain("BODY.PEEK[]");
+    expect(d.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a numeric id without connecting", async () => {
+    const d = rfcClient();
+    const r = await imapGetMessageRfc822("42", {}, d.deps);
+    expect(r).toEqual({ success: false, error: expect.stringContaining("Not an IMAP") });
+    expect(d.connect).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing message and releases the lock", async () => {
+    const d = rfcClient();
+    d.client.fetchOne.mockResolvedValue(false);
+    const r = await imapGetMessageRfc822(id, {}, d.deps);
+    expect(r).toEqual({ success: false, error: expect.stringContaining("not found") });
+    expect(d.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a message over maxBytes instead of truncating, and accepts one at the limit", async () => {
+    const exact = rfcClient(Buffer.alloc(10, 65));
+    const ok = await imapGetMessageRfc822(id, { maxBytes: 10 }, exact.deps);
+    expect(ok.success).toBe(true);
+    if (ok.success) expect(ok.acquisition.bytes.length).toBe(10);
+    expect(exact.client.fetchOne).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({ source: { start: 0, maxLength: 11 } }),
+      { uid: true }
+    );
+
+    const tooBig = rfcClient(Buffer.alloc(11, 65), { size: 5000 });
+    const r = await imapGetMessageRfc822(id, { maxBytes: 10 }, tooBig.deps);
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(r.error).toContain("larger than 10 bytes");
+      expect(r.error).toContain("RFC822.SIZE 5000");
+      expect(r.error).toContain("savePath");
+    }
+    expect(tooBig.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("clamps maxBytes to the file ceiling", async () => {
+    const d = rfcClient();
+    await imapGetMessageRfc822(id, { maxBytes: MAX_RFC822_FILE_BYTES * 4 }, d.deps);
+    expect(d.client.fetchOne).toHaveBeenCalledWith(
+      "42",
+      expect.objectContaining({ source: { start: 0, maxLength: MAX_RFC822_FILE_BYTES + 1 } }),
+      { uid: true }
+    );
+  });
+
+  it("warns when RFC822.SIZE disagrees with the bytes received, and when UIDVALIDITY is absent", async () => {
+    const mismatch = rfcClient(raw, { size: raw.length + 7 });
+    const r = await imapGetMessageRfc822(id, {}, mismatch.deps);
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.acquisition.size).toBe(raw.length + 7);
+      expect(r.acquisition.warnings).toEqual([expect.stringContaining("RFC822.SIZE is")]);
+      // The hash is still over what was received, never over the claimed size.
+      expect(r.acquisition.sha256).toBe(createHash("sha256").update(raw).digest("hex"));
+    }
+
+    const noValidity = rfcClient(raw, {}, false);
+    const r2 = await imapGetMessageRfc822(id, {}, noValidity.deps);
+    expect(r2.success).toBe(true);
+    if (r2.success) {
+      expect(r2.acquisition.uidValidity).toBeUndefined();
+      expect(r2.acquisition.warnings).toEqual([expect.stringContaining("UIDVALIDITY")]);
+    }
+  });
+
+  it("refuses an empty source rather than hashing nothing", async () => {
+    const d = rfcClient("");
+    const r = await imapGetMessageRfc822(id, {}, d.deps);
+    expect(r).toEqual({ success: false, error: expect.stringContaining("no message source") });
+    expect(d.release).toHaveBeenCalledTimes(1);
   });
 });

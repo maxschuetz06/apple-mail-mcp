@@ -71,6 +71,9 @@ import {
   imapGetMessage,
   imapGetMessageHeaders,
   imapGetMessageSource,
+  imapGetMessageRfc822,
+  MAX_RFC822_INLINE_BYTES,
+  MAX_RFC822_FILE_BYTES,
   imapMarkRead,
   imapMarkUnread,
   imapFlagMessage,
@@ -499,7 +502,13 @@ registerTool(
     description:
       "Use when: finding messages by query/sender/subject/date/read/flag filters and you need their ids for follow-up operations.\nReturns: matching messages with id, date, subject, sender, and read state (plus partial-coverage diagnostics when some mailboxes were skipped).\nDo not use when: you want a plain mailbox listing without filters (use list-messages), already have an id and want the body (use get-message), or want a whole conversation (use get-thread).\nPrefer this first to obtain the message ids that get-message/mark-as-read/delete-message/move-message and the batch tools require.",
     inputSchema: {
-      query: z.string().optional().describe("Text to search for in subject, sender, or content"),
+      query: z.string().optional().describe("Text to search for in subject or sender"),
+      body: z
+        .string()
+        .optional()
+        .describe(
+          "Text to search for in the message body (server-side IMAP BODY search). Requires the IMAP backend for the account searched; AppleScript-only accounts cannot search bodies and are reported as not searched."
+        ),
       from: z
         .string()
         .optional()
@@ -529,6 +538,7 @@ registerTool(
   withErrorHandling(
     async ({
       query,
+      body,
       mailbox,
       account,
       limit = 50,
@@ -549,6 +559,7 @@ registerTool(
       if (shouldUseImap(account)) {
         const imapArgs = {
           query,
+          body,
           mailbox,
           limit,
           dateFrom,
@@ -572,6 +583,24 @@ registerTool(
           mailManager.listAccounts(),
           resolveImapConfigs()
         );
+        // Body search is IMAP-only: AppleScript's `content contains` has to pull
+        // every message body through the Apple Event bridge and times out on
+        // real mailboxes. Rather than silently drop the body filter (and return
+        // subject/sender matches as if they were body matches), AppleScript-only
+        // accounts are skipped and reported as not searched.
+        if (body) {
+          const apple: AppleScan = {
+            rows: [],
+            diagnostics: {
+              ...emptyDiagnostics(),
+              partial: appleScriptOnly.length > 0,
+              notSearchedMailboxes: appleScriptOnly.map(
+                (a) => `${a.name} (body search requires the IMAP backend)`
+              ),
+            },
+          };
+          return mergedMessageResponse(fan, apple, limit, "matched");
+        }
         const apple = appleScanForAccounts(appleScriptOnly, (acctName) =>
           mailManager.searchMessagesWithDiagnostics(
             query,
@@ -587,6 +616,14 @@ registerTool(
           )
         );
         return mergedMessageResponse(fan, apple, limit, "matched");
+      }
+
+      if (body) {
+        return errorResponse(
+          `Body search requires the IMAP backend, which is not configured for ${
+            account ? `account "${account}"` : "any account"
+          }. Configure IMAP (see the IMAP backend section of the README) or search by query/subject/from instead.`
+        );
       }
 
       const { messages, diagnostics } = mailManager.searchMessagesWithDiagnostics(
@@ -844,6 +881,151 @@ registerTool(
       }),
     "Error retrieving message headers"
   )
+);
+
+// --- get-message-rfc822 ---
+
+registerTool(
+  "get-message-rfc822",
+  {
+    description:
+      "Use when: you need a message's complete original RFC 822 bytes exactly as the IMAP server stores them — for archival, forensic review, evidence preservation, or a verifiable .eml — together with the IMAP identity that links back to the source (uid, uidValidity, internalDate, flags, RFC822.SIZE) and a SHA-256 of the acquired bytes. IMAP-only: needs an imap: id from list-messages/search-messages on an IMAP-configured account.\nReturns: the acquisition record (account, mailbox, uid, uidValidity, internalDate, flags, size, bytes, sha256, messageId, readMethod, backend, warnings) plus either contentBase64 — the bytes, base64-encoded, carried in structuredContent only — or savedPath when savePath was given. No decoding, charset conversion, line-ending change or MIME re-serialization is applied.\nDo not use when: you want readable content (use get-message), only the headers (use get-message-headers), or one attachment (use fetch-attachment / save-attachment); or when the id is numeric — Mail.app's AppleScript bridge exposes its own rendering, not the stored bytes, so there is no AppleScript path.\nSafety: strictly read-only against the mailbox — EXAMINE + BODY.PEEK[], so \\Seen is not set and no STORE/COPY/MOVE/APPEND/EXPUNGE is issued; no Mail.app, AppleScript or osascript involved. Inline results are capped at 6 MiB of raw bytes (maxBytes) to stay under the MCP stdio 10 MB message limit; larger messages need savePath, which creates exactly one new file (never overwrites, mode 0600) inside the configured allowed roots, up to 25 MiB.",
+    inputSchema: {
+      id: MESSAGE_ID_SCHEMA.describe("An imap: message id (numeric Mail.app ids are refused)"),
+      savePath: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Directory inside the allowed roots to write the .eml into instead of returning base64; raises the ceiling to 25 MiB"
+        ),
+      fileName: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "File name to use with savePath (no path separators or '..'). Default: <account>-<mailbox>-uidv<uidValidity>-uid<uid>.eml"
+        ),
+      maxBytes: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          "Refuse (never truncate) a message larger than this many raw bytes. Default and inline maximum 6291456 (6 MiB); with savePath up to 26214400 (25 MiB)"
+        ),
+    },
+    outputSchema: {
+      id: z.string().optional(),
+      backend: z.literal("imap").optional(),
+      readMethod: z.string().optional().describe("The IMAP commands used"),
+      account: z.string().optional(),
+      mailbox: z.string().optional(),
+      uid: z.number().optional(),
+      uidValidity: z
+        .string()
+        .optional()
+        .describe(
+          "Mailbox UIDVALIDITY as a decimal string; with uid, the durable identity of the source message"
+        ),
+      internalDate: z
+        .string()
+        .optional()
+        .describe("ISO 8601 IMAP INTERNALDATE (arrival), not the Date: header"),
+      flags: z.array(z.string()).optional(),
+      size: z.number().optional().describe("RFC822.SIZE as reported by the server"),
+      bytes: z.number().optional().describe("Number of bytes acquired (and hashed)"),
+      sha256: z.string().optional().describe("Hex SHA-256 over exactly the acquired bytes"),
+      messageId: z
+        .string()
+        .optional()
+        .describe(
+          "Bare RFC 5322 Message-ID from ENVELOPE, for convenience; the authoritative copy is in the bytes"
+        ),
+      contentBase64: z
+        .string()
+        .optional()
+        .describe("The acquired bytes, base64-encoded (absent when savePath was used)"),
+      savedPath: z.string().optional(),
+      warnings: z.array(z.string()).optional(),
+    },
+  },
+  withErrorHandling(async ({ id, savePath, fileName, maxBytes }) => {
+    if (!id.startsWith("imap:")) {
+      return errorResponse(
+        `get-message-rfc822 needs an imap: id; "${id}" is a numeric Mail.app id. The stored bytes are only reachable over IMAP — Mail's AppleScript bridge exposes its own rendering, not the original message. Configure the account for IMAP (docs/IMAP-SETUP.md) and re-run list-messages/search-messages to get an imap: id.`
+      );
+    }
+    const ceiling = savePath ? MAX_RFC822_FILE_BYTES : MAX_RFC822_INLINE_BYTES;
+    if (maxBytes !== undefined && maxBytes > ceiling) {
+      return errorResponse(
+        `maxBytes ${maxBytes} exceeds the ${savePath ? "savePath" : "inline"} ceiling of ${ceiling} bytes` +
+          (savePath ? "." : "; pass savePath to write larger messages to disk.")
+      );
+    }
+    if (savePath) {
+      if (fileName !== undefined && (/[/\\\0]/.test(fileName) || fileName.includes(".."))) {
+        return errorResponse(`Invalid file name: "${fileName}"`);
+      }
+      // Directory + allowed-roots check BEFORE the fetch, so a refused path
+      // never costs a multi-MB download. The final path is checked again below
+      // once the default name (which needs UIDVALIDITY) is known.
+      try {
+        resolveAttachmentSaveTarget(savePath, fileName ?? "placeholder.eml");
+      } catch (error) {
+        return errorResponse(error instanceof Error ? error.message : String(error));
+      }
+    }
+    const r = await imapGetMessageRfc822(id, { maxBytes: maxBytes ?? ceiling });
+    if (!r.success) return errorResponse(r.error);
+    const a = r.acquisition;
+    const record = {
+      id,
+      backend: "imap" as const,
+      readMethod: a.readMethod,
+      account: a.account,
+      mailbox: a.mailbox,
+      uid: a.uid,
+      uidValidity: a.uidValidity,
+      internalDate: a.internalDate,
+      flags: a.flags,
+      size: a.size,
+      bytes: a.bytes.length,
+      sha256: a.sha256,
+      messageId: a.messageId,
+      warnings: a.warnings.length ? a.warnings : undefined,
+    };
+    const summary =
+      `UID ${a.uid} in "${a.mailbox}" (${a.account}): ${a.bytes.length} bytes, sha256 ${a.sha256}` +
+      (a.uidValidity ? `, UIDVALIDITY ${a.uidValidity}` : "") +
+      (a.internalDate ? `, INTERNALDATE ${a.internalDate}` : "") +
+      `, flags [${a.flags.join(" ")}]` +
+      (a.warnings.length ? `. Warnings: ${a.warnings.join(" ")}` : "");
+    if (!savePath) {
+      // The base64 rides ONLY in structuredContent. Repeating it in the text
+      // block would double the payload, and the MCP stdio client drops the
+      // connection above 10 MB with no error text (apple-notes-mcp #162).
+      return successResponse(`${summary}. Bytes are in structuredContent.contentBase64.`, {
+        ...record,
+        contentBase64: a.bytes.toString("base64"),
+      });
+    }
+    const safe = (s: string) => s.replace(/[^A-Za-z0-9._@-]+/g, "_");
+    const name =
+      fileName ??
+      `${safe(a.account)}-${safe(a.mailbox)}-uidv${a.uidValidity ?? "unknown"}-uid${a.uid}.eml`;
+    let target: { saveDirectory: string; savedPath: string };
+    try {
+      target = resolveAttachmentSaveTarget(savePath, name);
+    } catch (error) {
+      return errorResponse(error instanceof Error ? error.message : String(error));
+    }
+    writeFileSync(target.savedPath, a.bytes, { flag: "wx", mode: 0o600 });
+    return successResponse(`${summary}. Written to ${target.savedPath}.`, {
+      ...record,
+      savedPath: target.savedPath,
+    });
+  }, "Error acquiring message source")
 );
 
 // --- get-thread ---
@@ -1484,7 +1666,10 @@ registerTool(
     inputSchema: {
       id: MESSAGE_ID_SCHEMA,
       transport: COMPOSE_TRANSPORT_SCHEMA,
-      body: z.string().min(1, "Reply body is required"),
+      body: z
+        .string()
+        .min(1, "Reply body is required")
+        .describe("Reply body (plain text; HTML tags such as <br> are not rendered)"),
       replyAll: z.boolean().optional().default(false).describe("Reply to all recipients"),
       send: z
         .boolean()
@@ -1516,7 +1701,7 @@ registerTool(
       id: MESSAGE_ID_SCHEMA,
       transport: COMPOSE_TRANSPORT_SCHEMA,
       to: z.array(z.string()).min(1, "At least one recipient is required"),
-      body: z.string().optional().describe("Optional message to prepend"),
+      body: z.string().optional().describe("Optional message to prepend (plain text)"),
       send: z
         .boolean()
         .optional()

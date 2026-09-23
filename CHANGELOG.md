@@ -1,17 +1,133 @@
 ## [Unreleased]
 
-## [2.19.8] - 2026-09-18
-
-### Added
-- Explicit `sender` and native `signature` selection for `create-draft`, with `list-signatures` for discovery. Account names resolve to actual enabled sender addresses; mismatched or ambiguous selections fail before composition.
-- `send-saved-draft` validates and submits a previously MCP-created draft while its original composer still exists in the same Mail session. Preview is the default; sending requires `dryRun: false`. The initial implementation deliberately supports single-recipient drafts without CC/BCC or attachments.
+## [2.19.12] - 2026-09-22
 
 ### Fixed
-- Draft creation explicitly saves and checks the sender, signature, and body before returning a structured receipt. Compose mutations are not automatically retried, avoiding duplicate drafts after uncertain outcomes.
+
+- **`reply-to-message`/`forward-message` no longer drop the quoted original
+  on the AppleScript transport**
+  ([#249](https://github.com/sweetrb/apple-mail-mcp/issues/249), reported by
+  @Sealjay): a saved draft (`send: false`) — and any send that falls back to
+  AppleScript because SMTP isn't configured — set Mail's `content` property to
+  just the new text, discarding the "On \<date\>, \<sender\> wrote:" quote Mail
+  normally adds. The reporter traced this precisely: `content of theReply`
+  reads back as empty immediately after `reply`, and still after `save`, so
+  the quote Mail builds internally is real (a draft saved *without* touching
+  `content` shows it) but unreadable through AppleScript — there is nothing to
+  read back and prepend to. `replyToMessage`/`forwardMessage` now build the
+  quoted body in TypeScript, reusing the same `quoteBody`/attribution/
+  forwarded-message-header helpers the SMTP transport already uses, so an
+  AppleScript-transport draft or send matches what SMTP sends. A forward with
+  no `body` to prepend is left untouched, matching its pre-existing (already
+  correct) behavior.
+- **`reply-to-message`'s `body` parameter now documents that it's plain
+  text** (`send-email`/`create-draft` already said so; `reply-to-message`
+  didn't, and the reporter sent literal `<br>` tags expecting HTML rendering).
+  `forward-message`'s `body` now says the same.
+
+## [2.19.11] - 2026-09-21
+
+### Fixed
+
+- **`list-messages`/`search-messages` no longer trust an IMAP search total
+  that exceeds the mailbox's own message count**
+  ([#246](https://github.com/sweetrb/apple-mail-mcp/issues/246), reported by
+  @j5pu): on their `j5pu@icloud.com` account, `list-messages` on `INBOX`
+  reported `100085` total listed against a mailbox `list-mailboxes` and a
+  direct IMAP `SEARCH ALL` both agreed held exactly 14 messages, and paginated
+  `list-messages` calls beyond offset 0 silently returned zero messages with
+  no error. Reproduced directly against the vendored `imapflow` dependency
+  (1.7.8, `node_modules/imapflow/lib/commands/search.js`): even though this
+  server never requests `returnOptions` (the "legacy" SEARCH path), that path
+  still registers an untagged `ESEARCH` handler alongside `SEARCH` — some
+  servers answer even a plain `SEARCH` with an `ESEARCH` response — and when
+  the server's `ESEARCH` `ALL` attribute is a compact sequence-set range
+  (e.g. `"4:739330"`), `imapflow` expands it in a loop bounded by
+  `connection.mailbox.exists` rather than by the range's actual content. If
+  that cached count is wrong at the moment the response is parsed, the loop
+  fabricates that many sequential "matches" that were never real search hits.
+  A crafted reproduction against the exact shipped `search.js` confirmed this:
+  a stale/wrong `exists` of 100085 against a true 14-message mailbox produces
+  exactly 100085 bogus results, and reversing/paging into that fabricated,
+  mostly-sequential list explains both the wrong total and why only messages
+  near offset 0 (where the fabricated range coincidentally overlaps real
+  UIDs) resolved to real messages while every deeper page came back empty.
+  `list-messages`/`search-messages` now cross-check the search-derived match
+  count against a fresh `STATUS` call — the same one `list-mailboxes` already
+  relies on, and always a live server round trip independent of `imapflow`'s
+  cached mailbox state — before trusting it: a mailbox whose search total
+  exceeds its own `STATUS` message count is now treated as a failed mailbox
+  (surfaced via the existing `failedMailboxes` reporting) rather than
+  returning a fabricated total or paging into nonexistent UIDs. The exact
+  trigger for the corrupted `exists` value in this account's live session
+  (stale reuse of an already-selected mailbox, an out-of-band untagged
+  `EXISTS` landing mid-command, or an iCloud-specific `ESEARCH` quirk) was not
+  independently confirmed against a live server or a raw protocol capture —
+  this guard is a defensive invariant that holds regardless of the root
+  cause, not a claim about which mechanism produced it.
+
+## [2.19.10] - 2026-09-20
+
+### Added
+
+- **`get-message-rfc822`** acquires a message's complete original RFC 822
+  bytes exactly as the IMAP server stores them, with the identity that links
+  the copy back to its source
+  ([#244](https://github.com/sweetrb/apple-mail-mcp/issues/244), requested by
+  @j5pu): `uid`, `uidValidity`, `internalDate`, `flags`, `size`
+  (`RFC822.SIZE`), the byte count actually acquired, a SHA-256 over exactly
+  those bytes, the `Message-ID`, and the IMAP commands used. Nothing is
+  decoded, charset-converted, line-ending-normalized or re-serialized.
+  Read-only by construction — the mailbox is opened with `EXAMINE` and the
+  body fetched with `BODY.PEEK[]`, so `\Seen` is untouched and no
+  `STORE`/`COPY`/`MOVE`/`APPEND`/`EXPUNGE` is issued — and IMAP-only, with no
+  Mail.app, AppleScript or osascript involvement (a numeric id is refused with
+  an explanation rather than served from Mail's rendering). The bytes come
+  back as `contentBase64` in `structuredContent` only — the text block never
+  repeats them, so a 6 MiB message stays under the MCP stdio client's 10 MB
+  hard cap — or, with `savePath`, are written to one new `.eml` (never
+  overwrites, mode 0600, allowed roots only) for messages up to 25 MiB.
+  `maxBytes` is a refusal ceiling, never a truncation point; `warnings[]`
+  reports an `RFC822.SIZE` that disagrees with the bytes received, or a
+  missing `UIDVALIDITY`.
+
+## [2.19.9] - 2026-09-20
+
+### Added
+
+- **`search-messages` gains a `body` parameter for server-side body search.**
+  On an IMAP-configured account it adds an IMAP `BODY` criterion, ANDed with
+  the other filters, so a word that appears only in the text of a message can
+  be found in one call instead of listing a sender's mail and reading each
+  message. `query` still matches subject and sender only; its schema
+  description claimed "subject, sender, or content" and now says what it does.
+  Body search is IMAP-only because AppleScript's `content contains` has to pull
+  every body through the Apple Event bridge. An explicit AppleScript account
+  returns an error naming the IMAP requirement, and an unscoped search reports
+  AppleScript-only accounts under `notSearchedMailboxes` rather than silently
+  returning subject/sender matches as if they were body matches. Verified
+  against iCloud (`imap.mail.me.com`), which honours `SEARCH BODY`.
+
+## [2.19.8] - 2026-09-19
+
+### Fixed
+
+- **`send-email` (AppleScript transport) and `create-draft` no longer retry a
+  timed-out compose.** Both ran `executeAppleScript` with `maxRetries: 2`, and
+  that helper retries on a timeout and on Mail's "timed out" / "busy" error
+  strings — so a `send newMessage` that Mail had already accepted before the
+  Apple Event timed out was composed and submitted a second time, and a slow
+  draft save could leave a duplicate in Drafts. Both paths now make exactly one
+  attempt and report the failure; the caller inspects Sent/Outbox or Drafts
+  before repeating, the same contract `reply-to-message` and `forward-message`
+  already had. `send-serial-email` goes through the same send path and inherits
+  the fix. Surfaced while reviewing #241, whose new draft tools deliberately
+  use a single attempt.
 
 ## [2.19.7] - 2026-09-15
 
 ### Added
+
 - **`search-messages` and `list-messages` rows now carry `dateSent`** on the
   AppleScript backend, matching what the IMAP backend has emitted since 2.19.2
   and what `get-message` has emitted since 2.19.0/2.19.6. Every row now reports
@@ -33,10 +149,11 @@
 All four findings from @j5pu's #234 (tested on 2.19.5).
 
 ### Fixed
+
 - **`get-message` no longer reports an invented `dateSent`** (#234 §2b). On the
   AppleScript path `dateSent` is Mail's own `date sent` property, and for a
   `Date:` header Mail cannot parse that is a timestamp of Mail's choosing: the
-  reporter saw `2024-08-24` for a 2007 message that *arrived* `2014-01-14` — a
+  reporter saw `2024-08-24` for a 2007 message that _arrived_ `2014-01-14` — a
   send time a decade after arrival. A `dateSent` more than **7 days** later than
   `dateReceived` is now omitted, on both backends, through one shared helper
   (`plausibleDateSent`). Seven days clears real sender clock skew (minutes,
@@ -75,11 +192,13 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   `false`.
 
 ### Added
+
 - `get-message-headers` returns `backend` (`"imap"` or `"applescript"`), so a
   backend-specific defect like the §2 fusion is visible in the response, and
   `warnings[]` when a malformed block was repaired.
 
 ### Known limitations
+
 - `search-messages` / `list-messages` rows on **iCloud** still show `*` in a
   `sender` display name written as raw 8-bit bytes. That value is the server's
   ENVELOPE, already rewritten before it reaches the client, and recovering it
@@ -89,10 +208,11 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.19.5] - 2026-09-14
 
 ### Fixed
+
 - **`get-thread`** threw `RangeError: Invalid time value` for any thread
   member carrying a truthy-but-unparseable envelope date (#226 follow-up) —
   its per-message `date` field called `new Date(m.envelope.date)
-  .toISOString()` unguarded, the same shape #228 fixed in `structuredRow` for
+.toISOString()` unguarded, the same shape #228 fixed in `structuredRow` for
   `search-messages`/`list-messages` but never applied here. Now uses the same
   `isoOrEmpty` helper: the date is omitted, never invented.
 - **`search-messages`/`list-messages`/`get-thread`'s AppleScript-backed rows**
@@ -103,7 +223,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   whose arrival date Mail.app couldn't parse.
 
   @j5pu's #226 follow-up report — `search-messages` throwing `Invalid time
-  value` against a mailbox migrated from Entourage/Outlook for Mac with
+value` against a mailbox migrated from Entourage/Outlook for Mac with
   Spanish-locale `Date:` headers (`jue ago 30 13:55:12 2007`) — turned out to
   already be fixed as a side effect of #228 landing 6 minutes after the
   report (confirmed with a byte-exact regression test). These two are
@@ -113,10 +233,11 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.19.4] - 2026-09-13
 
 ### Fixed
+
 - `Date:` headers written with a **non-English month abbreviation** were
   unparseable, so the header date was lost for every affected message (#229,
   reported by @j5pu with byte-exact `BODY.PEEK[HEADER]` output). Legacy
-  Entourage / Outlook for Mac wrote the *system locale's* abbreviation rather
+  Entourage / Outlook for Mac wrote the _system locale's_ abbreviation rather
   than RFC 5322's English one, so a mailbox migrated from them carries dates
   like `jue ago 30 13:55:12 2007`, which `Date.parse` rejects.
 
@@ -140,11 +261,12 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.19.3] - 2026-09-13
 
 ### Fixed
+
 - An AppleScript date that could not be parsed was replaced with **the current
   time** rather than omitted (#229, reported by @j5pu). `parseAppleScriptDate`
   returned `new Date()` on failure, which is indistinguishable from a real
   timestamp — a message whose date the parser did not recognise silently
-  claimed to have been sent or received *now*.
+  claimed to have been sent or received _now_.
 
   It also made an existing guard dead code. `parseMessageDates` has always read
   `Number.isNaN(d.getTime()) ? undefined : d`, which could never fire, because a
@@ -155,7 +277,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   2.19.2 — a date is omitted, never invented.
 
   ⚠️ Note for anyone chasing the same report: `new Date("mié oct 10 14:25:15
-  2007")` **succeeds** in V8, which reads it as 2007-10-10. The Spanish-locale
+2007")` **succeeds** in V8, which reads it as 2007-10-10. The Spanish-locale
   header shape in #229 therefore never reaches this failure path, and the
   header-fusion symptom described there is a separate, still-unreproduced
   issue.
@@ -163,6 +285,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.19.2] - 2026-09-13
 
 ### Fixed
+
 - IMAP list/search rows emitted the `Date:` header under the name
   `dateReceived`, so the same field meant "sent" on the IMAP backend and
   "arrived" on the AppleScript one, and no IMAP row carried `dateSent` at all
@@ -189,6 +312,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.19.1] - 2026-09-13
 
 ### Fixed
+
 - `get-message-headers`' header-block parser (`parseHeaderBlock`) had no
   handling for bare-CR (`\r`-only) line endings, a real quirk of Mail's
   `all headers of msg` AppleScript property that this codebase already
@@ -207,6 +331,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.19.0] - 2026-09-12
 
 ### Added
+
 - `get-message-headers` tool (#224, requested by @j5pu): returns a message's raw
   RFC 5322 header block **without fetching the body or attachments**, plus the
   parsed fields chronological and threading work needs — `date` (ISO 8601, from
@@ -229,6 +354,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   field is omitted, never invented, when the backend cannot supply it.
 
 ### Fixed
+
 - `get-message` over IMAP returned an **empty `rfcMessageId` for every message**
   since the field was added in 2.2.0. The IMAP branch parsed the Message-ID out
   of the tool's own `info` text, which is subject + body and never carried a
@@ -238,11 +364,13 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   said `""`. The AppleScript branch was unaffected.
 
 ### Changed
+
 - The three AppleScript by-id reads (`getMessageContent`, `getRawSource` and the
   new `getMessageHeaders`) now share one unscoped-scan script builder; the first
   two previously carried byte-identical copies of it. No behaviour change.
 
 ### Documentation
+
 - README: `get-message-headers` Tool Reference entry, the two-dates note on
   `get-message`, and a "Read Headers" feature row. CLAUDE.md: when to trust
   `dateSent` over `dateReceived`. `docs/IMAP-SETUP.md` and the bundled skill list
@@ -251,9 +379,10 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.18.1] - 2026-09-10
 
 ### Fixed
+
 - By-id batch and single mutations now verify that the message AppleScript
   resolved is actually the one requested, before deleting or moving it.
-  `whose id is N` is **not an exact match** — Mail *rounds*. Measured against a
+  `whose id is N` is **not an exact match** — Mail _rounds_. Measured against a
   real store on 2026-09-10: `whose id is 78364.6` resolves to id **78365**, a
   different, adjacent message. So an id that reaches AppleScript with any
   imprecision does not fail; it silently selects a neighbour, and the walk then
@@ -268,6 +397,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 ## [2.18.0] - 2026-09-10
 
 ### Added
+
 - SMTP send now files a best-effort **Sent-folder copy** over IMAP (#220). After a
   successful submission the raw message is APPENDed, flagged `\Seen`, to the Sent
   mailbox of whichever configured IMAP account's login matches the SMTP identity —
@@ -292,6 +422,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   transport, which has no equivalent.
 
 ### Documentation
+
 - README: the "No Sent-folder copy" limitation under the SMTP transport is
   replaced with the new best-effort behaviour, including when the copy is skipped.
 
@@ -301,13 +432,13 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 
 - Permission-denied detection is no longer tied to the American spelling
   (#218, reported by @jarrah31). macOS emits an Automation refusal in the
-  **system language**, so an en_GB/en_AU/en_IE Mac says *"Not authorised to
-  send Apple events to Mail. (-1743)"* — which `PERMISSION_DENIED_PATTERN`
+  **system language**, so an en_GB/en_AU/en_IE Mac says _"Not authorised to
+  send Apple events to Mail. (-1743)"_ — which `PERMISSION_DENIED_PATTERN`
   never matched. Two things followed: `health-check`/`doctor` computed
   `passed: !isPermError` as **true**, skipped the early `healthy: false`
   return, and fell through to the accounts probe, so a genuine TCC denial
   reported `permissions: ok` and told users with fully configured Mail to
-  *"Set up an account in Mail.app first."*; and because the same constant is
+  _"Set up an account in Mail.app first."_; and because the same constant is
   the first entry in the error mapping, the refusal was never normalised, so
   **no tool anywhere in the server** offered an en-GB user any remediation.
   The pattern now accepts both spellings **and** the `(-1743)`
@@ -327,7 +458,9 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   before this release.
 
 ## [2.17.9] - 2026-09-09
+
 ### Fixed
+
 - IMAP pipeline: upgraded `imapflow` to 1.7.8, which keeps the download
   pipeline's error forwarder attached across a backpressure wait — an error
   during a paused/backpressured IMAP stream now propagates correctly instead
@@ -337,6 +470,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   access-policy checks.
 
 ### Changed
+
 - SMTP send: `nodemailer` 9.1.1 adds a `maxRecipients` cap option (not yet
   wired up as a server-facing setting).
 - Dev tooling: `@typescript-eslint/eslint-plugin`/`parser` and
@@ -402,7 +536,9 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   only consumer; `build/cli.js` is unaffected). No behavior change.
 
 ## [2.17.5] - 2026-09-02
+
 ### Changed
+
 - Dependency bump via Dependabot; committed bundle rebuilt. (automated)
 
 ## [2.17.4] - 2026-09-01
@@ -451,7 +587,9 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   v2.3.0) no longer reproduce on current main; no behavior changed. (#203)
 
 ## [2.17.2] - 2026-08-26
+
 ### Changed
+
 - Dependency bump via Dependabot; committed bundle rebuilt. (automated)
 
 ## [2.17.1] - 2026-08-25
@@ -486,7 +624,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
 - The container-walk that builds a mailbox's path no longer raises `(-1728)`
   against a real account. Mail never reports the bare `account` class Apple's
   own docs use — only a concrete subclass (`imap account`, `exchange
-  account`, …) — so the walk's terminator condition was dead code and
+account`, …) — so the walk's terminator condition was dead code and
   `container of <account>` errored on every account type; a local "On My Mac"
   mailbox hit an equivalent phantom-container error one hop earlier. The walk
   now whitelists `mailbox`/`container` classes and guards every accessor with
@@ -512,7 +650,7 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   empty-string `mailbox` (schema-legal, since `mailbox` is merely optional)
   took neither the single-mailbox nor the all-mailboxes parsing branch, so
   every returned message reported the wrong mailbox and `hasAttachments:
-  false` regardless of the real value — and cached the wrong mailbox for
+false` regardless of the real value — and cached the wrong mailbox for
   later by-id reads, replies, and deletes.
 - The no-`account` fan-out in `search-messages`/`list-messages` no longer
   aborts the whole call (discarding results already gathered from other
@@ -521,7 +659,9 @@ All four findings from @j5pu's #234 (tested on 2.19.5).
   used for a timeout or an oversized mailbox.
 
 ## [2.16.1] - 2026-08-19
+
 ### Changed
+
 - `imapflow` 1.6.6 → 1.7.0: makes the auto-IDLE delay configurable, aligns the
   socket watchdog with the auto-IDLE busy guard, and validates `autoIdleDelay`
   to keep auto-IDLE off a busy connection.
@@ -558,10 +698,10 @@ visible; this makes the mail inside them reachable.
 ### Fixed
 
 - **The mailbox create/delete/rename failure message claimed local mailboxes
-  were exempt, and they are not (#193).** It said *"only local 'On My Mac'
-  mailboxes support this"*. Measured 2026-08-16: `delete` on a genuinely local
+  were exempt, and they are not (#193).** It said _"only local 'On My Mac'
+  mailboxes support this"_. Measured 2026-08-16: `delete` on a genuinely local
   mailbox raises `-10000` in every form — a bound reference, `delete mailbox
-  "X"`, and via the parent. So a user who had just failed to delete a local
+"X"`, and via the parent. So a user who had just failed to delete a local
   mailbox was told local mailboxes are the ones that work.
 
   `create` **does** succeed, which makes the asymmetry easy to trip over:
@@ -590,7 +730,7 @@ visible; this makes the mail inside them reachable.
   diff: once as `disappeared`, once as `appeared`.
 
   If the caller had not named it, it also landed in `unrequested`, which the
-  audit log documents as *"IS the #155 symptom, with names attached"*. So the
+  audit log documents as _"IS the #155 symptom, with names attached"_. So the
   instrument could report a message that **demonstrably never left** as evidence
   of data loss — the fabricated finding this layer exists to avoid, produced by
   a mechanism the reporter had already documented.
@@ -671,7 +811,7 @@ actually evidences.
   collapsed to `unavailable` — with no holes recorded and no warning.
 
   Every reading in #155 is an undercount of what left, i.e. an after-count
-  *higher* than the mailbox truly holds. So the one mechanism that can name an
+  _higher_ than the mailbox truly holds. So the one mechanism that can name an
   unrequested departure was disabling itself precisely in the scenario it exists
   for, and saying nothing while it did. Regression from #177 (2.10.33);
   v2.10.32 read the mailbox unbounded and could not over-request.
@@ -760,7 +900,7 @@ regressing.
 
 Partial progress on #183 — the half that needs no new AppleScript. **#183 stays
 open**: local "On My Mac" mailboxes are still not enumerated. What changes is
-that the server no longer *implies they do not exist*.
+that the server no longer _implies they do not exist_.
 
 ### Fixed
 
@@ -784,7 +924,7 @@ that the server no longer *implies they do not exist*.
   account whose LIST threw, or an AppleScript account Mail refused, was logged to
   stderr and omitted, leaving a short list that looked complete. Those are now
   named: the result carries `partial: true` + `failedAccounts`, the text says the
-  list is incomplete, and a fan-out where *every* source failed is an error
+  list is incomplete, and a fan-out where _every_ source failed is an error
   rather than "No mailboxes found". Matches the contract `get-mail-stats` and
   `get-unread-count` already follow.
 
@@ -802,18 +942,18 @@ v2.10.32 read `id of messages of mb` unbounded; the chunking fix added
   the two are read as consecutive Apple Events in one script with nothing
   between them — they are co-stale, not independent instruments. When the count
   read **low**, every position past the bound was **never requested**, and only
-  a *failed* slice enters `_sMiss`, so an unrequested tail left no trace: the
+  a _failed_ slice enters `_sMiss`, so an unrequested tail left no trace: the
   status stayed `ok` and the record claimed a complete observation.
 
   Those messages were then present in `before`, absent from `after`, and landed
   in `disappeared` — and, if the caller never named them, in `unrequested`,
-  which the audit log documents as *"IS the #155 symptom, with names attached"*.
+  which the audit log documents as _"IS the #155 symptom, with names attached"_.
   That is precisely the fabricated finding the #176 contract promises is
   impossible: an innocent message put in front of someone mid-incident as
   evidence of data loss.
 
   The snapshot now probes exactly **one** position past the bound. One rather
-  than a slice, because an out-of-range *range* raises as a whole, so an
+  than a slice, because an out-of-range _range_ raises as a whole, so an
   over-requested slice cannot distinguish "nothing there" from "the count was
   low by more than a chunk". A message found there means the count was low; the
   unread tail is recorded as a hole, which makes the snapshot `partial` under
@@ -821,7 +961,7 @@ v2.10.32 read `id of messages of mb` unbounded; the chunking fix added
   poison. No new status and no new gating.
 
   The probe cannot fire spuriously: when the count is accurate the probed
-  position does not exist, and a specifier that *clamps* instead of raising
+  position does not exist, and a specifier that _clamps_ instead of raising
   hands back an id this enumeration already recorded, which is ignored. Whether
   Mail's `messages i thru j` clamps or raises is still not established across
   backends, so both are handled rather than assumed.
@@ -852,11 +992,11 @@ say whether its effect was actually observed.
 
   `structuredContent.verification` is three-valued in effect:
 
-  | verdict | meaning |
-  |---|---|
-  | `verified` | the effect was observed — UIDPLUS `COPYUID` named the new UID in the destination, or the UID is gone from the source |
-  | `unverified` | the server accepted the command and nothing could confirm the effect; `why` says what stopped it |
-  | *(failure)* | `success: false` — the server rejected the command outright (2.12.0) |
+  | verdict      | meaning                                                                                                              |
+  | ------------ | -------------------------------------------------------------------------------------------------------------------- |
+  | `verified`   | the effect was observed — UIDPLUS `COPYUID` named the new UID in the destination, or the UID is gone from the source |
+  | `unverified` | the server accepted the command and nothing could confirm the effect; `why` says what stopped it                     |
+  | _(failure)_  | `success: false` — the server rejected the command outright (2.12.0)                                                 |
 
   `unverified` is **not a failure** and is not rendered as one. Reporting it is
   the point: an absent verification must never read as a successful one, which
@@ -882,7 +1022,7 @@ say whether its effect was actually observed.
 
 First of two changes for #181. This one closes the channel through which a
 rejected IMAP command was reported as a success; the follow-up adds a
-three-valued verdict that distinguishes *verified* from merely *not rejected*.
+three-valued verdict that distinguishes _verified_ from merely _not rejected_.
 
 ### Fixed
 
@@ -963,7 +1103,6 @@ full tool surface against real mail. The first is a safety fix.
 - `replyToMessage` / `forwardMessage` return `{ success, error? }` instead of a
   bare `boolean`, so the reason survives to the tool layer.
 
-
 ## [2.11.1] - 2026-08-16
 
 Three defects found by an end-to-end regression sweep against real mail. All
@@ -997,21 +1136,20 @@ expose them.
   the same single round trip with no extra request.
 
 - **`doctor` and `health-check` reported `permissions: ok` on a real TCC denial.**
-  `mapError` normalises an Automation refusal to *"Permission denied. Grant
-  automation access…"*, replacing the raw text — and `healthCheck` then
+  `mapError` normalises an Automation refusal to _"Permission denied. Grant
+  automation access…"_, replacing the raw text — and `healthCheck` then
   classified the failure by re-testing for `"not authorized"` / `"not
-  permitted"`, the very substrings the normalisation had just removed. So
+permitted"`, the very substrings the normalisation had just removed. So
   `isPermError` was unreachable, the check reported `passed: true` while its own
   detail line read "Permission denied", and the early `healthy: false` return
-  never fired. The run then fell through to the accounts probe and surfaced *"No
-  Mail accounts found. Set up an account in Mail.app first"* — sending the user
+  never fired. The run then fell through to the accounts probe and surfaced _"No
+  Mail accounts found. Set up an account in Mail.app first"_ — sending the user
   to configure accounts they already have, when the real problem was one
   Automation grant.
 
   Classification and normalisation now derive from one exported pattern
   (`isPermissionDenied`, `PERMISSION_DENIED_MESSAGE`) so they cannot drift apart
   again, and the classifier accepts both the raw and the normalised form.
-
 
 ## [2.11.0] - 2026-08-16
 
@@ -1045,7 +1183,7 @@ asserted something this server cannot know. Both are gone.
 ### Changed
 
 - **`observed` is documented as a LOWER BOUND on how many messages left** — the
-  movement of Mail's *count*, which has been observed lagging a delete it had
+  movement of Mail's _count_, which has been observed lagging a delete it had
   already performed. It is not "how many messages left", and a short reading is
   not evidence about your operation. **The per-id outcomes report success; this
   number does not.**
@@ -1053,7 +1191,7 @@ asserted something this server cannot know. Both are gone.
   The evidence, from @scottstern0325 on iCloud: for two batches reporting
   `observed: 0` the messages were found in Trash, matched by `date received` +
   sender against the audit-log pre-image. Four readings — 0 of 4, 0 of 1 (a
-  *single-id* delete), 15 of 16, 14 of 15 — with a shortfall unrelated to batch
+  _single-id_ delete), 15 of 16, 14 of 15 — with a shortfall unrelated to batch
   size.
 
 - **`unknownReason` distinguishes four cases that are not interchangeable**:
@@ -1074,7 +1212,7 @@ asserted something this server cannot know. Both are gone.
 
 - **The collateral diff's `"snapshot": "ok"` is documented as necessary but not
   sufficient.** The enumeration is bounded by Mail's message count, so a count
-  reading *low* truncates it silently: the unread tail is never requested, never
+  reading _low_ truncates it silently: the unread tail is never requested, never
   registers as a failed slice, and the status still says `"ok"`, while messages
   past the bound look like they disappeared. This narrows the guarantee stated in
   2.10.33 and is tracked as its own defect.
@@ -1100,7 +1238,7 @@ asserted something this server cannot know. Both are gone.
 ### Added
 
 - **`"snapshot": "partial"` — a diff that names its own gap.** When a slice still will not
-  read, the record reports what it *could* observe plus an `unobserved` list of the
+  read, the record reports what it _could_ observe plus an `unobserved` list of the
   unreadable position ranges per phase, instead of the old all-or-nothing `unavailable`.
   "Nothing unrequested left the 400 messages I could see, and I could not see the other
   120" is strictly more useful than no diff, and honest about the hole.
@@ -1130,8 +1268,8 @@ asserted something this server cannot know. Both are gone.
   `pnpm-workspace.yaml`), thanks to [@anupamme](https://github.com/anupamme) in
   [#174](https://github.com/sweetrb/apple-mail-mcp/pull/174). Development/CI-time policy
   only -- no shipped bytes change. It is not redundant with Dependabot's existing 7-day
-  cooldown: the cooldown governs what Dependabot *proposes* (direct dependencies), while
-  `minimumReleaseAge` governs what a resolution *installs*, including transitives
+  cooldown: the cooldown governs what Dependabot _proposes_ (direct dependencies), while
+  `minimumReleaseAge` governs what a resolution _installs_, including transitives
   Dependabot never sees. This repo was the one carrying such an entry -- a 5-day-old
   transitive `ip-address@10.5.0`, admitted by the 1440 default with the cooldown fully in
   force. Applied across all four Apple MCP repos so the value cannot drift.

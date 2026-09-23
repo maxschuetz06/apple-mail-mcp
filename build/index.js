@@ -56978,7 +56978,7 @@ var require_tools2 = __commonJS({
     var libmime = require_libmime();
     var { resolveCharset } = require_charsets2();
     var { compiler } = require_imap_handler();
-    var { createHash } = __require("crypto");
+    var { createHash: createHash2 } = __require("crypto");
     var { JPDecoder } = require_jp_decoder();
     var iconv = require_lib();
     var FLAG_COLORS = ["red", "orange", "yellow", "green", "blue", "purple", "grey"];
@@ -57608,7 +57608,7 @@ var require_tools2 = __commonJS({
             } catch {
             }
           }
-          map.id = map.emailId || createHash("md5").update([path, mailbox.uidValidity?.toString() || "", map.uid.toString()].join(":")).digest("hex");
+          map.id = map.emailId || createHash2("md5").update([path, mailbox.uidValidity?.toString() || "", map.uid.toString()].join(":")).digest("hex");
         }
         if (map.flags) {
           let flagColor = tools.getFlagColor(map.flags);
@@ -65362,6 +65362,8 @@ __export(imapClient_exports, {
   HEADER_WINDOW_BYTES: () => HEADER_WINDOW_BYTES,
   IMAP_ENV: () => IMAP_ENV,
   MAX_COMPOSE_SOURCE_BYTES: () => MAX_COMPOSE_SOURCE_BYTES,
+  MAX_RFC822_FILE_BYTES: () => MAX_RFC822_FILE_BYTES,
+  MAX_RFC822_INLINE_BYTES: () => MAX_RFC822_INLINE_BYTES,
   __resetPool: () => __resetPool,
   __setPoolConnect: () => __setPoolConnect,
   bodyStructureHasAttachments: () => bodyStructureHasAttachments,
@@ -65384,6 +65386,7 @@ __export(imapClient_exports, {
   imapFlagMessage: () => imapFlagMessage,
   imapGetMessage: () => imapGetMessage,
   imapGetMessageHeaders: () => imapGetMessageHeaders,
+  imapGetMessageRfc822: () => imapGetMessageRfc822,
   imapGetMessageSource: () => imapGetMessageSource,
   imapHealthCheck: () => imapHealthCheck,
   imapListAttachments: () => imapListAttachments,
@@ -65408,6 +65411,7 @@ __export(imapClient_exports, {
   resolveMailboxPath: () => resolveMailboxPath,
   shouldUseImap: () => shouldUseImap
 });
+import { createHash } from "node:crypto";
 function encodeImapId(account, path, uid) {
   const payload = Buffer.from(JSON.stringify({ a: account, p: path, u: uid }), "utf8").toString(
     "base64url"
@@ -65631,6 +65635,7 @@ async function resolveMailboxPath(client, mailbox, _mode) {
 function buildCriteria(a, listMode) {
   const c = {};
   if (a.query) c.or = [{ subject: a.query }, { from: a.query }];
+  if (a.body) c.body = a.body;
   if (a.from) c.from = a.from;
   if (a.subject) c.subject = a.subject;
   if (a.isRead === true) c.seen = true;
@@ -65733,6 +65738,12 @@ async function fetchMailboxMatches(client, path, criteria, newestCount) {
     const found = await client.search(criteria, { uid: true });
     const uids = Array.isArray(found) ? found : [];
     if (uids.length === 0 || newestCount === 0) return { messages: [], total: uids.length };
+    const status = await client.status(path, { messages: true });
+    if (typeof status.messages === "number" && uids.length > status.messages) {
+      throw new Error(
+        `IMAP SEARCH on "${path}" reported ${uids.length} matches, more than the mailbox's own ${status.messages} messages \u2014 discarding as corrupted rather than trusting it (see #246).`
+      );
+    }
     const newest = uids.slice().reverse().slice(0, newestCount);
     const byUid = /* @__PURE__ */ new Map();
     for await (const msg of client.fetch(
@@ -66211,6 +66222,75 @@ async function imapGetMessageSource(id, deps = {}) {
         throw new Error("Original message source exceeds the 25 MiB reply/forward limit.");
       }
       return { raw: msg.source.toString(), subject: msg.envelope?.subject, accountUser: cfg.user };
+    } finally {
+      lock.release();
+    }
+  });
+}
+async function imapGetMessageRfc822(id, opts = {}, deps = {}) {
+  const ref = decodeImapId(id);
+  if (!ref) return { success: false, error: `Not an IMAP message id: "${id}".` };
+  const requested = Math.floor(opts.maxBytes ?? MAX_RFC822_INLINE_BYTES);
+  const limit = Math.min(Math.max(1, requested), MAX_RFC822_FILE_BYTES);
+  return withClient(depsForMessageRef(ref, deps), async (client) => {
+    const lock = await client.getMailboxLock(ref.path, { readOnly: true });
+    try {
+      const mb = client.mailbox;
+      const uidValidity = mb && mb.uidValidity !== void 0 && mb.uidValidity !== null ? String(mb.uidValidity) : void 0;
+      const msg = await client.fetchOne(
+        String(ref.uid),
+        {
+          uid: true,
+          flags: true,
+          internalDate: true,
+          size: true,
+          envelope: true,
+          source: { start: 0, maxLength: limit + 1 }
+        },
+        { uid: true }
+      );
+      if (!msg) {
+        return { success: false, error: `IMAP message UID ${ref.uid} not found in "${ref.path}".` };
+      }
+      if (!msg.source || !msg.source.length) {
+        return { success: false, error: "IMAP returned no message source." };
+      }
+      const bytes = asBuffer(msg.source);
+      const size = typeof msg.size === "number" ? msg.size : void 0;
+      if (bytes.length > limit) {
+        return {
+          success: false,
+          error: `Message UID ${ref.uid} in "${ref.path}" is larger than ${limit} bytes` + (size !== void 0 ? ` (RFC822.SIZE ${size})` : "") + `; nothing was acquired (the ceiling refuses, it never truncates). Raise maxBytes \u2014 inline ceiling ${MAX_RFC822_INLINE_BYTES} \u2014 or pass savePath to write up to ${MAX_RFC822_FILE_BYTES} bytes to disk.`
+        };
+      }
+      const warnings = [];
+      if (size !== void 0 && size !== bytes.length) {
+        warnings.push(
+          `RFC822.SIZE is ${size} but ${bytes.length} bytes were acquired: the server's size accounting and its stored bytes disagree. sha256 covers what was received.`
+        );
+      }
+      if (uidValidity === void 0) {
+        warnings.push(
+          "The server did not report UIDVALIDITY for this mailbox; uid alone is not a durable identity."
+        );
+      }
+      return {
+        success: true,
+        acquisition: {
+          account: ref.account,
+          mailbox: ref.path,
+          uid: ref.uid,
+          uidValidity,
+          internalDate: isoOrUndefined(msg.internalDate),
+          flags: msg.flags ? Array.from(msg.flags) : [],
+          size,
+          bytes,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          messageId: msg.envelope?.messageId ? normalizeMessageId(msg.envelope.messageId) : void 0,
+          readMethod: `EXAMINE "${ref.path}"; UID FETCH ${ref.uid} (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE BODY.PEEK[]<0.${limit + 1}>)`,
+          warnings
+        }
+      };
     } finally {
       lock.release();
     }
@@ -66733,7 +66813,7 @@ async function imapThread(id, deps = {}, limit = 50) {
     true
   );
 }
-var import_imapflow, IMAP_ENV, defaultConnect, SPECIAL_USE_ALIASES, poolConnect, pools, connecting, MAX_COMPOSE_SOURCE_BYTES, HEADER_WINDOW_BYTES, MAIL_FLAG_BITS, imapMarkRead, imapMarkUnread, FALLBACK_TRASH_PATH, imapBatchMarkRead, imapBatchMarkUnread, imapBatchFlag, imapBatchUnflag, imapBatchDelete;
+var import_imapflow, IMAP_ENV, defaultConnect, SPECIAL_USE_ALIASES, poolConnect, pools, connecting, MAX_COMPOSE_SOURCE_BYTES, MAX_RFC822_INLINE_BYTES, MAX_RFC822_FILE_BYTES, HEADER_WINDOW_BYTES, MAIL_FLAG_BITS, imapMarkRead, imapMarkUnread, FALLBACK_TRASH_PATH, imapBatchMarkRead, imapBatchMarkUnread, imapBatchFlag, imapBatchUnflag, imapBatchDelete;
 var init_imapClient = __esm({
   "src/services/imapClient.ts"() {
     "use strict";
@@ -66789,6 +66869,8 @@ var init_imapClient = __esm({
     pools = /* @__PURE__ */ new Map();
     connecting = /* @__PURE__ */ new Map();
     MAX_COMPOSE_SOURCE_BYTES = 25 * 1024 * 1024;
+    MAX_RFC822_INLINE_BYTES = 6 * 1024 * 1024;
+    MAX_RFC822_FILE_BYTES = MAX_COMPOSE_SOURCE_BYTES;
     HEADER_WINDOW_BYTES = 64 * 1024;
     MAIL_FLAG_BITS = ["$MailFlagBit0", "$MailFlagBit1", "$MailFlagBit2"];
     imapMarkRead = (id, deps = {}) => flagOp(id, "\\Seen", true, deps);
@@ -86905,10 +86987,6 @@ function buildReplyOptions(args) {
     );
     cc = extra.length ? extra : void 0;
   }
-  const attribution = buildAttribution(original);
-  const quoted = originalPlainText.trim() ? `
-
-${attribution}${quoteBody(originalPlainText)}` : "";
   const references = dedupe(
     original.messageId ? [...original.references, original.messageId] : original.references
   );
@@ -86916,11 +86994,18 @@ ${attribution}${quoteBody(originalPlainText)}` : "";
     to,
     cc,
     subject: withSubjectPrefix(original.subject, "Re:"),
-    body: `${body}${quoted}`,
+    body: buildReplyBody(body, original, originalPlainText),
     inReplyTo: original.messageId,
     references: references.length ? references : void 0,
     from
   };
+}
+function buildReplyBody(body, original, originalPlainText) {
+  const attribution = buildAttribution(original);
+  const quoted = originalPlainText.trim() ? `
+
+${attribution}${quoteBody(originalPlainText)}` : "";
+  return `${body}${quoted}`;
 }
 function buildAttribution(original) {
   const who = original.from[0] ?? original.replyTo[0] ?? "the sender";
@@ -86930,6 +87015,14 @@ function buildAttribution(original) {
 }
 function buildForwardOptions(args) {
   const { original, originalPlainText, to, body, from } = args;
+  return {
+    to: dedupe(to),
+    subject: withSubjectPrefix(original.subject, "Fwd:"),
+    body: buildForwardBody(original, originalPlainText, body),
+    from
+  };
+}
+function buildForwardBody(original, originalPlainText, body) {
   const headerBlock = [
     "---------- Forwarded message ----------",
     original.from.length ? `From: ${original.from.join(", ")}` : "",
@@ -86941,14 +87034,9 @@ function buildForwardOptions(args) {
   const prefix = body?.trim() ? `${body}
 
 ` : "";
-  return {
-    to: dedupe(to),
-    subject: withSubjectPrefix(original.subject, "Fwd:"),
-    body: `${prefix}${headerBlock}
+  return `${prefix}${headerBlock}
 
-${originalPlainText}`,
-    from
-  };
+${originalPlainText}`;
 }
 
 // src/tools/compose.ts
@@ -87086,6 +87174,31 @@ async function readOriginal(deps, id, cfg) {
   const content = deps.mail.getMessageContent(id);
   return { original: parseOriginalHeaders(raw), plainText: content?.plainText ?? null };
 }
+async function readOriginalForQuote(deps, id) {
+  if (decodeImapId(id)) {
+    try {
+      const source = await deps.imapSource(id);
+      const original = parseOriginalHeaders(source.raw);
+      if (source.subject !== void 0) original.subject = source.subject;
+      return { original, plainText: extractTextBody(source.raw) ?? "" };
+    } catch {
+      return null;
+    }
+  }
+  const raw = deps.mail.getRawSource(id);
+  if (!raw) return null;
+  const content = deps.mail.getMessageContent(id);
+  return { original: parseOriginalHeaders(raw), plainText: content?.plainText ?? "" };
+}
+async function replyComposeBody(deps, id, body) {
+  const source = await readOriginalForQuote(deps, id);
+  return source ? buildReplyBody(body, source.original, source.plainText) : body;
+}
+async function forwardComposeBody(deps, id, body) {
+  if (!body) return body;
+  const source = await readOriginalForQuote(deps, id);
+  return source ? buildForwardBody(source.original, source.plainText, body) : body;
+}
 async function runCompose(deps, args) {
   const { id, send, transport: transport2 } = args;
   const verb = args.kind === "reply" ? "reply to" : "forward";
@@ -87156,7 +87269,17 @@ async function runCompose(deps, args) {
     return errorResponse(
       `Failed to ${verb} message "${id}": ${resolved.error ?? "message not found"}`
     );
-  const outcome = args.kind === "reply" ? deps.mail.replyToMessage(resolved.numericId, args.body, args.replyAll, send) : deps.mail.forwardMessage(resolved.numericId, args.to, args.body, send);
+  const outcome = args.kind === "reply" ? deps.mail.replyToMessage(
+    resolved.numericId,
+    await replyComposeBody(deps, id, args.body),
+    args.replyAll,
+    send
+  ) : deps.mail.forwardMessage(
+    resolved.numericId,
+    args.to,
+    await forwardComposeBody(deps, id, args.body),
+    send
+  );
   if (!outcome.success)
     return errorResponse(
       `Failed to ${verb} message "${id}": ${outcome.error ?? "Mail.app compose failed"}`
@@ -88131,7 +88254,10 @@ registerTool(
   {
     description: "Use when: finding messages by query/sender/subject/date/read/flag filters and you need their ids for follow-up operations.\nReturns: matching messages with id, date, subject, sender, and read state (plus partial-coverage diagnostics when some mailboxes were skipped).\nDo not use when: you want a plain mailbox listing without filters (use list-messages), already have an id and want the body (use get-message), or want a whole conversation (use get-thread).\nPrefer this first to obtain the message ids that get-message/mark-as-read/delete-message/move-message and the batch tools require.",
     inputSchema: {
-      query: external_exports.string().optional().describe("Text to search for in subject, sender, or content"),
+      query: external_exports.string().optional().describe("Text to search for in subject or sender"),
+      body: external_exports.string().optional().describe(
+        "Text to search for in the message body (server-side IMAP BODY search). Requires the IMAP backend for the account searched; AppleScript-only accounts cannot search bodies and are reported as not searched."
+      ),
       from: external_exports.string().optional().describe(
         "Filter by sender (substring match against the full sender string, i.e. display name + address \u2014 not an exact address match)"
       ),
@@ -88149,6 +88275,7 @@ registerTool(
   withErrorHandling(
     async ({
       query,
+      body,
       mailbox,
       account,
       limit = 50,
@@ -88162,6 +88289,7 @@ registerTool(
       if (shouldUseImap(account)) {
         const imapArgs = {
           query,
+          body,
           mailbox,
           limit,
           dateFrom,
@@ -88185,6 +88313,19 @@ registerTool(
           mailManager.listAccounts(),
           resolveImapConfigs()
         );
+        if (body) {
+          const apple2 = {
+            rows: [],
+            diagnostics: {
+              ...emptyDiagnostics(),
+              partial: appleScriptOnly.length > 0,
+              notSearchedMailboxes: appleScriptOnly.map(
+                (a) => `${a.name} (body search requires the IMAP backend)`
+              )
+            }
+          };
+          return mergedMessageResponse(fan, apple2, limit, "matched");
+        }
         const apple = appleScanForAccounts(
           appleScriptOnly,
           (acctName) => mailManager.searchMessagesWithDiagnostics(
@@ -88201,6 +88342,11 @@ registerTool(
           )
         );
         return mergedMessageResponse(fan, apple, limit, "matched");
+      }
+      if (body) {
+        return errorResponse(
+          `Body search requires the IMAP backend, which is not configured for ${account ? `account "${account}"` : "any account"}. Configure IMAP (see the IMAP backend section of the README) or search by query/subject/from instead.`
+        );
       }
       const { messages, diagnostics } = mailManager.searchMessagesWithDiagnostics(
         query,
@@ -88395,6 +88541,108 @@ registerTool(
     }),
     "Error retrieving message headers"
   )
+);
+registerTool(
+  "get-message-rfc822",
+  {
+    description: "Use when: you need a message's complete original RFC 822 bytes exactly as the IMAP server stores them \u2014 for archival, forensic review, evidence preservation, or a verifiable .eml \u2014 together with the IMAP identity that links back to the source (uid, uidValidity, internalDate, flags, RFC822.SIZE) and a SHA-256 of the acquired bytes. IMAP-only: needs an imap: id from list-messages/search-messages on an IMAP-configured account.\nReturns: the acquisition record (account, mailbox, uid, uidValidity, internalDate, flags, size, bytes, sha256, messageId, readMethod, backend, warnings) plus either contentBase64 \u2014 the bytes, base64-encoded, carried in structuredContent only \u2014 or savedPath when savePath was given. No decoding, charset conversion, line-ending change or MIME re-serialization is applied.\nDo not use when: you want readable content (use get-message), only the headers (use get-message-headers), or one attachment (use fetch-attachment / save-attachment); or when the id is numeric \u2014 Mail.app's AppleScript bridge exposes its own rendering, not the stored bytes, so there is no AppleScript path.\nSafety: strictly read-only against the mailbox \u2014 EXAMINE + BODY.PEEK[], so \\Seen is not set and no STORE/COPY/MOVE/APPEND/EXPUNGE is issued; no Mail.app, AppleScript or osascript involved. Inline results are capped at 6 MiB of raw bytes (maxBytes) to stay under the MCP stdio 10 MB message limit; larger messages need savePath, which creates exactly one new file (never overwrites, mode 0600) inside the configured allowed roots, up to 25 MiB.",
+    inputSchema: {
+      id: MESSAGE_ID_SCHEMA.describe("An imap: message id (numeric Mail.app ids are refused)"),
+      savePath: external_exports.string().min(1).optional().describe(
+        "Directory inside the allowed roots to write the .eml into instead of returning base64; raises the ceiling to 25 MiB"
+      ),
+      fileName: external_exports.string().min(1).optional().describe(
+        "File name to use with savePath (no path separators or '..'). Default: <account>-<mailbox>-uidv<uidValidity>-uid<uid>.eml"
+      ),
+      maxBytes: external_exports.number().int().min(1).optional().describe(
+        "Refuse (never truncate) a message larger than this many raw bytes. Default and inline maximum 6291456 (6 MiB); with savePath up to 26214400 (25 MiB)"
+      )
+    },
+    outputSchema: {
+      id: external_exports.string().optional(),
+      backend: external_exports.literal("imap").optional(),
+      readMethod: external_exports.string().optional().describe("The IMAP commands used"),
+      account: external_exports.string().optional(),
+      mailbox: external_exports.string().optional(),
+      uid: external_exports.number().optional(),
+      uidValidity: external_exports.string().optional().describe(
+        "Mailbox UIDVALIDITY as a decimal string; with uid, the durable identity of the source message"
+      ),
+      internalDate: external_exports.string().optional().describe("ISO 8601 IMAP INTERNALDATE (arrival), not the Date: header"),
+      flags: external_exports.array(external_exports.string()).optional(),
+      size: external_exports.number().optional().describe("RFC822.SIZE as reported by the server"),
+      bytes: external_exports.number().optional().describe("Number of bytes acquired (and hashed)"),
+      sha256: external_exports.string().optional().describe("Hex SHA-256 over exactly the acquired bytes"),
+      messageId: external_exports.string().optional().describe(
+        "Bare RFC 5322 Message-ID from ENVELOPE, for convenience; the authoritative copy is in the bytes"
+      ),
+      contentBase64: external_exports.string().optional().describe("The acquired bytes, base64-encoded (absent when savePath was used)"),
+      savedPath: external_exports.string().optional(),
+      warnings: external_exports.array(external_exports.string()).optional()
+    }
+  },
+  withErrorHandling(async ({ id, savePath, fileName, maxBytes }) => {
+    if (!id.startsWith("imap:")) {
+      return errorResponse(
+        `get-message-rfc822 needs an imap: id; "${id}" is a numeric Mail.app id. The stored bytes are only reachable over IMAP \u2014 Mail's AppleScript bridge exposes its own rendering, not the original message. Configure the account for IMAP (docs/IMAP-SETUP.md) and re-run list-messages/search-messages to get an imap: id.`
+      );
+    }
+    const ceiling = savePath ? MAX_RFC822_FILE_BYTES : MAX_RFC822_INLINE_BYTES;
+    if (maxBytes !== void 0 && maxBytes > ceiling) {
+      return errorResponse(
+        `maxBytes ${maxBytes} exceeds the ${savePath ? "savePath" : "inline"} ceiling of ${ceiling} bytes` + (savePath ? "." : "; pass savePath to write larger messages to disk.")
+      );
+    }
+    if (savePath) {
+      if (fileName !== void 0 && (/[/\\\0]/.test(fileName) || fileName.includes(".."))) {
+        return errorResponse(`Invalid file name: "${fileName}"`);
+      }
+      try {
+        resolveAttachmentSaveTarget(savePath, fileName ?? "placeholder.eml");
+      } catch (error2) {
+        return errorResponse(error2 instanceof Error ? error2.message : String(error2));
+      }
+    }
+    const r = await imapGetMessageRfc822(id, { maxBytes: maxBytes ?? ceiling });
+    if (!r.success) return errorResponse(r.error);
+    const a = r.acquisition;
+    const record2 = {
+      id,
+      backend: "imap",
+      readMethod: a.readMethod,
+      account: a.account,
+      mailbox: a.mailbox,
+      uid: a.uid,
+      uidValidity: a.uidValidity,
+      internalDate: a.internalDate,
+      flags: a.flags,
+      size: a.size,
+      bytes: a.bytes.length,
+      sha256: a.sha256,
+      messageId: a.messageId,
+      warnings: a.warnings.length ? a.warnings : void 0
+    };
+    const summary = `UID ${a.uid} in "${a.mailbox}" (${a.account}): ${a.bytes.length} bytes, sha256 ${a.sha256}` + (a.uidValidity ? `, UIDVALIDITY ${a.uidValidity}` : "") + (a.internalDate ? `, INTERNALDATE ${a.internalDate}` : "") + `, flags [${a.flags.join(" ")}]` + (a.warnings.length ? `. Warnings: ${a.warnings.join(" ")}` : "");
+    if (!savePath) {
+      return successResponse(`${summary}. Bytes are in structuredContent.contentBase64.`, {
+        ...record2,
+        contentBase64: a.bytes.toString("base64")
+      });
+    }
+    const safe = (s) => s.replace(/[^A-Za-z0-9._@-]+/g, "_");
+    const name = fileName ?? `${safe(a.account)}-${safe(a.mailbox)}-uidv${a.uidValidity ?? "unknown"}-uid${a.uid}.eml`;
+    let target;
+    try {
+      target = resolveAttachmentSaveTarget(savePath, name);
+    } catch (error2) {
+      return errorResponse(error2 instanceof Error ? error2.message : String(error2));
+    }
+    writeFileSync4(target.savedPath, a.bytes, { flag: "wx", mode: 384 });
+    return successResponse(`${summary}. Written to ${target.savedPath}.`, {
+      ...record2,
+      savedPath: target.savedPath
+    });
+  }, "Error acquiring message source")
 );
 registerTool(
   "get-thread",
@@ -88843,7 +89091,7 @@ registerTool(
     inputSchema: {
       id: MESSAGE_ID_SCHEMA,
       transport: COMPOSE_TRANSPORT_SCHEMA,
-      body: external_exports.string().min(1, "Reply body is required"),
+      body: external_exports.string().min(1, "Reply body is required").describe("Reply body (plain text; HTML tags such as <br> are not rendered)"),
       replyAll: external_exports.boolean().optional().default(false).describe("Reply to all recipients"),
       send: external_exports.boolean().optional().default(true).describe("Send immediately (false = save as draft)")
     },
@@ -88867,7 +89115,7 @@ registerTool(
       id: MESSAGE_ID_SCHEMA,
       transport: COMPOSE_TRANSPORT_SCHEMA,
       to: external_exports.array(external_exports.string()).min(1, "At least one recipient is required"),
-      body: external_exports.string().optional().describe("Optional message to prepend"),
+      body: external_exports.string().optional().describe("Optional message to prepend (plain text)"),
       send: external_exports.boolean().optional().default(true).describe("Send immediately (false = save as draft)")
     },
     outputSchema: {
