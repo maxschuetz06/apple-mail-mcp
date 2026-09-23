@@ -2,14 +2,20 @@ import {
   buildAppLevelScript,
   escapeForAppleScript,
   escapeForAppleScriptBody,
-} from "@/utils/appleScriptText.js";
-export { escapeForAppleScript, escapeForAppleScriptBody } from "@/utils/appleScriptText.js";
+} from "@/utils/mailScriptBuilders.js";
+export { escapeForAppleScript, escapeForAppleScriptBody } from "@/utils/mailScriptBuilders.js";
 import {
   createSavedDraft,
   listMailSignatures,
   type DraftOptions,
   type DraftResult,
 } from "./draftCompose.js";
+import {
+  sendSavedDraft,
+  type SavedDraftInput,
+  type SavedDraftPreview,
+  type SavedDraftSubmission,
+} from "./draftSend.js";
 /**
  * Apple Mail Manager
  *
@@ -3420,7 +3426,9 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
     }
 
     const script = buildAppLevelScript(sendCommand);
-    const result = executeAppleScript(script, { timeoutMs: 60000, maxRetries: 2 });
+    // Exactly one attempt. A timed-out send may already have been accepted by
+    // Mail; retrying would compose and submit a duplicate.
+    const result = executeAppleScript(script, { timeoutMs: 60000, maxRetries: 1 });
 
     if (!result.success) {
       console.error(`Failed to send email: ${result.error}`);
@@ -3574,6 +3582,10 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
 
   listSignatures(): string[] {
     return listMailSignatures();
+  }
+
+  sendSavedDraft(input: SavedDraftInput): Promise<SavedDraftPreview | SavedDraftSubmission> {
+    return sendSavedDraft(input);
   }
 
   /**
