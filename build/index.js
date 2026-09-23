@@ -66520,6 +66520,11 @@ async function imapGetMessageRfc822(id, opts = {}, deps = {}) {
         acquisition: {
           account: ref.account,
           accountUser: cfg.user,
+          envelopeRecipients: msg.envelope?.to || msg.envelope?.cc || msg.envelope?.bcc ? {
+            to: msg.envelope.to?.map((address) => address.address ?? "") ?? [],
+            cc: msg.envelope.cc?.map((address) => address.address ?? "") ?? [],
+            bcc: msg.envelope.bcc?.map((address) => address.address ?? "") ?? []
+          } : void 0,
           mailbox: ref.path,
           uid: ref.uid,
           uidValidity,
@@ -82069,6 +82074,13 @@ function prepare(acquisition, draftId) {
   const cc = addressFields(parsed.headers, "cc");
   const bcc = addressFields(parsed.headers, "bcc");
   const replyTo = addressFields(parsed.headers, "reply-to");
+  if (!acquisition.envelopeRecipients) {
+    throw new Error("IMAP did not report draft envelope recipients; no send performed.");
+  }
+  const same = (left, right) => left.map((address) => address.toLowerCase()).sort().join("\0") === right.map((address) => address.toLowerCase()).sort().join("\0");
+  if (!same(to, acquisition.envelopeRecipients.to) || !same(cc, acquisition.envelopeRecipients.cc) || !same(bcc, acquisition.envelopeRecipients.bcc)) {
+    throw new Error("Draft MIME recipients differ from the IMAP envelope; no send performed.");
+  }
   if (from.length !== 1 || to.length + cc.length + bcc.length === 0) {
     throw new Error("Draft needs exactly one From address and at least one recipient.");
   }
